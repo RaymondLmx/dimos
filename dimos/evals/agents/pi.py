@@ -306,7 +306,8 @@ class PiAdapter(Agent):
         return prompt
 
     def _no_dimos_files(self, env: RunningEnvironment, run_dir: Path) -> dict[str, Path]:
-        """The robot as plain topics, or the selected observations as plain files."""
+        """Robot cases: live topics only (ROBOT.md). Dataset cases: the selected observations
+        exported as plain files, since the memory store needs dimOS to read."""
         files = dict(env.artifacts)
         files.pop("recording", None)  # a dimOS memory store; not readable without dimOS
         if env.raw_endpoint:

@@ -53,12 +53,16 @@ dimos evals run dimos.evals.suites.examples --agent dimos.evals.agents.dimcode \
 ```
 
 `no_dimos` does four things. Pi runs with a `PATH` that has no dimOS executable or checkout
-venv, no `PYTHONPATH` and no `DIMOS_*` variables, so `import dimos` and `dimos` fail. Recorded
-observations are exported as plain files, lossless PNGs, XYZ/RGB CSVs and JSON primitives with
-a manifest, instead of the memory store. A robot is exposed as plain topics through
-`raw-robot-bridge` (below); the MCP tool listing and the `dimos mcp call` guidance are omitted.
-And `excluded_keywords` defaults to `dimos, dimensionalos`, which denies any tool call that
-mentions them.
+venv, no `PYTHONPATH` and no `DIMOS_*` variables, so `import dimos` and `dimos` fail. A robot
+is exposed as live topics through `raw-robot-bridge` (below) and nothing else: no recording,
+no MCP tool listing, no `dimos mcp call` guidance. `excluded_keywords` defaults to
+`dimos, dimensionalos`, which denies any tool call that mentions them. And for `Dataset` cases,
+which ask about an existing recording with no robot running, the selected observations are
+exported as plain files, lossless PNGs, XYZ/RGB CSVs and JSON primitives with a manifest,
+because the memory store is pickled dimOS objects the agent cannot read. That export,
+`plain_recording`, came in with the sandboxed baseline in
+[#4112](https://github.com/dimensionalOS/dimos/pull/4112) and is the recorded-data counterpart
+of the bridge; robot cases never use it.
 
 ### Keyword guard
 
