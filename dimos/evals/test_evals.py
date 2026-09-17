@@ -25,6 +25,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -912,3 +913,22 @@ def test_yes_no_tolerates_markdown_emphasis(reply: str, expected: str) -> None:
     from dimos.evals.scorers import yes_no
 
     assert yes_no(reply) == expected
+
+
+def test_failed_agent_run_keeps_its_duration(dataset: str, tmp_path: Path) -> None:
+    class RaisingAgent(FakeAgent):
+        def run(
+            self, inputs: str, env: RunningEnvironment, run_dir: Path, *, timeout_s: float
+        ) -> Trajectory:
+            time.sleep(0.05)
+            raise RuntimeError("adapter died")
+
+    case = EvalCase(
+        id="dies",
+        inputs="?",
+        environment=Dataset(dataset, select=(lambda store: store.streams.odom.limit(1),)),
+        grade=lambda outcome: 1.0,
+    )
+    result = EvalRunner(out_dir=tmp_path).run([case], RaisingAgent())[0]
+    assert "adapter died" in result.error
+    assert result.agent_duration_s >= 0.05

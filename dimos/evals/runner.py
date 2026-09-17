@@ -164,8 +164,10 @@ class EvalRunner(Configurable):
                     dict.fromkeys(agent.available_tools(tuple(_tools_exposed(env.mcp_url))))
                 )
                 started = time.monotonic()
-                trajectory = agent.run(case.inputs, env, case_dir, timeout_s=case.timeout_s)
-                agent_duration_s = time.monotonic() - started
+                try:
+                    trajectory = agent.run(case.inputs, env, case_dir, timeout_s=case.timeout_s)
+                finally:
+                    agent_duration_s = time.monotonic() - started
                 _write_trajectory(case_dir, trajectory, tools)
                 case.environment.settle(max(0.0, case.timeout_s - agent_duration_s))
             finally:
@@ -217,6 +219,7 @@ class EvalRunner(Configurable):
             score=score,
             passed=score >= case.threshold and not error,
             duration_s=time.monotonic() - t0,
+            agent_duration_s=agent_duration_s,
             error=error,
         )
         if trajectory is None:
@@ -228,7 +231,6 @@ class EvalRunner(Configurable):
             steps=totals.total_steps,
             model_turns=sum(s.source == "agent" for s in trajectory.steps),
             tool_calls=sum(len(s.tool_calls or ()) for s in trajectory.steps),
-            agent_duration_s=agent_duration_s,
             request_attempts=len(list((self.run_dir / case.id / "raw").glob("*-request.json"))),
             prompt_tokens=totals.total_prompt_tokens,
             completion_tokens=totals.total_completion_tokens,

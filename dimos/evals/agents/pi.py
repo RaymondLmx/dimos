@@ -161,6 +161,12 @@ class PiAdapterConfig(ModelAgentConfig):
     # The agent gets the robot as plain topics or files and no dimOS: PATH without dimOS,
     # no memory store or MCP guidance, and excluded_keywords defaulting to dimOS's names.
     no_dimos: bool = False
+    # Host variables the Pi process may inherit; the provider key is added by name and
+    # DIMOS_* variables pass through unless no_dimos. Everything else stays on the host.
+    passthrough_env: tuple[str, ...] = (
+        "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR",
+        "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    )  # fmt: skip
 
     # Reasoning level passed to Pi's --thinking flag.
     thinking: Thinking = "medium"
@@ -371,11 +377,14 @@ class PiAdapter(Agent):
             raise ValueError(f"Tool allowlist was not applied: {state}")
 
     def _build_process_env(self, paths: RunPaths) -> dict[str, str]:
-        env = dict(os.environ)
+        keep = {*self.config.passthrough_env, self._key_env}
+        dimos_vars = not self.config.no_dimos
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k in keep or (dimos_vars and k.startswith("DIMOS_"))
+        }
         if self.config.no_dimos:
-            env = {k: v for k, v in env.items() if not k.startswith("DIMOS_")}
-            env.pop("PYTHONPATH", None)
-            env.pop("VIRTUAL_ENV", None)
             env["PATH"] = os.pathsep.join(
                 d for d in env.get("PATH", "").split(os.pathsep) if not _ships_dimos(d)
             )
