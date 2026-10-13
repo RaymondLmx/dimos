@@ -50,6 +50,7 @@ from dimos_lcm.std_msgs import Bool
 
 from dimos.msgs.geometry_msgs.PointStamped import PointStamped
 from dimos.msgs.nav_msgs.Path import Path
+from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.web.codecs import is_generic_lcm_encoding
 from dimos.web.lcm_codec import default_encoding, export_schema, schema_class_for
 from dimos.web.relay_bridge.manifest import (
@@ -425,6 +426,59 @@ class Map2D(Panel):
 
 
 @dataclass(frozen=True)
+class Map3D(Panel):
+    """3D voxel map: a PointCloud2 stream (the mapper's global map by
+    default) voxelized at `res` and drawn as points, with the pose marker."""
+
+    kind: ClassVar[str] = "map3d"
+    cloud: str = "global_map"
+    pose: str | None = "odom"
+    res: float = field(default=0.05, kw_only=True)
+    max_hz: float = field(default=1.0, kw_only=True)
+    pose_hz: float = field(default=20.0, kw_only=True)
+    title: str = field(default="", kw_only=True)
+
+    def __post_init__(self) -> None:
+        _check_stream("cloud", self.cloud)
+        if self.pose is not None:
+            _check_stream("pose", self.pose)
+        _check_rate("res", self.res)
+        _check_rate("max_hz", self.max_hz)
+        _check_rate("pose_hz", self.pose_hz)
+
+    def _channels(self) -> tuple[Channel, ...]:
+        # Not a built-in bridge port, so the panel declares it (like Map2D's
+        # path) and cockpit() generates the typed port. A late viewer gets the
+        # last full map through the resend.
+        return (
+            Channel(
+                self.cloud,
+                PointCloud2,
+                encoding="voxels.zlib.v1",
+                delivery="latest",
+                max_hz=self.max_hz,
+                params={"res": self.res},
+                resend_on_subscribe=True,
+            ),
+        )
+
+    def _channel_requests(self) -> tuple[ChannelRequest, ...]:
+        requests = [
+            ChannelRequest(
+                self.cloud,
+                "rx",
+                "voxels.zlib.v1",
+                self.max_hz,
+                {"res": self.res},
+                delivery="latest",
+            )
+        ]
+        if self.pose is not None:
+            requests.append(ChannelRequest(self.pose, "rx", "pose.json.v1", self.pose_hz))
+        return tuple(requests)
+
+
+@dataclass(frozen=True)
 class Teleop(Panel):
     """Keyboard teleop: twist datagrams on one tx stream (WASD drive, Q/E
     strafe, Shift boost, Space e-stop; click the panel to arm).
@@ -625,7 +679,7 @@ def build_manifest_data(
     dict.
 
     Shared by cockpit() and the bridge's availability-driven default
-    manifest (default_manifest in relay_bridge_module.py). `registry` and
+    manifest (default_manifest in relay_bridge/config.py). `registry` and
     `tx_registry` map built-in stream name -> (encoding, delivery) in
     advertisement order (the bridge's BUILTIN_CHANNELS/TX_CHANNELS tables);
     tx_streams are the module's typed Out names. Panel ids are p0..pN in
@@ -835,13 +889,13 @@ def cockpit(
             raise ValueError(f"duplicate channel declaration for stream {entry.stream!r}")
         declared[entry.stream] = entry
     try:
-        from dimos.web.relay_bridge.dynamic import DynamicPortSpec, make_relay_bridge_class
-        from dimos.web.relay_bridge.relay_bridge_module import (
+        from dimos.web.relay_bridge.channels import (
             BUILTIN_CHANNELS,
             TX_CHANNELS,
-            RelayBridgeModule,
             RuntimeChannelSpec,
         )
+        from dimos.web.relay_bridge.dynamic import DynamicPortSpec, make_relay_bridge_class
+        from dimos.web.relay_bridge.relay_bridge_module import RelayBridgeModule
     except ImportError as e:
         raise RuntimeError(
             "the cockpit blueprint needs the web extra: `uv sync --extra web --inexact`"
