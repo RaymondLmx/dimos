@@ -35,6 +35,18 @@ const IMAGE: ChannelSpec = {
   requiredScope: null,
 };
 
+// A *.lcm.v1 channel decodes from the schema in its params; one without a
+// usable schema has no decoder at all.
+const LCM_POSE: ChannelSpec = {
+  ...ODOM,
+  ch: "lcm_pose",
+  encoding: "geometry_msgs.PoseStamped.lcm.v1",
+  params: {
+    lcm: { type: "t.P", fp: "0011223344556677", structs: { "t.P": [["x", "double", null]] } },
+  },
+};
+const LCM_BROKEN: ChannelSpec = { ...ODOM, ch: "lcm_bad", encoding: "t.Q.lcm.v1" };
+
 function mf(channels: ChannelSpec[], panels: PanelSpec[] = []): Manifest {
   return { version: 1, channels, panels, layout: null, pages: [] };
 }
@@ -54,6 +66,7 @@ describe("App session states", () => {
   let channels: ChannelStore;
   let session: Session;
   let watch: Session["watch"];
+  let shown: string[][];
 
   beforeEach(() => {
     container = document.createElement("div");
@@ -76,7 +89,8 @@ describe("App session states", () => {
       onMsg: () => () => {},
       status,
     });
-    act(() => root.render(<App session={session} />));
+    shown = [];
+    act(() => root.render(<App session={session} onShownPanels={(ids) => shown.push(ids)} />));
   });
 
   afterEach(() => {
@@ -94,6 +108,29 @@ describe("App session states", () => {
   };
   const switchButton = () => container.querySelector<HTMLElement>('[data-testid="switch-robot"]');
   const panel = () => container.querySelector('[data-testid="panel-cam"]');
+
+  it("shows *.lcm.v1 rows from their manifest schema, not a registered decoder", () => {
+    act(() => {
+      status.update({ watchedRobot: ROBOT, robots: [ROBOT] });
+      status.update({ manifest: mf([LCM_POSE, LCM_BROKEN]) });
+      channels.ingest(
+        "lcm_pose",
+        { ch: "lcm_pose", seq: 3, ts: 0.3, delivery: "reliable" },
+        { x: 1.5 },
+        true,
+        "{x: 1.5}",
+      );
+      channels.publishUi();
+    });
+    view("channels");
+    expect(container.querySelector('[data-testid="ch-lcm_pose-seq"]')!.textContent).toBe("3");
+    expect(container.querySelector('[data-testid="ch-lcm_pose-value"]')!.textContent).toContain(
+      "{x: 1.5}",
+    );
+    expect(container.querySelector('[data-testid="ch-lcm_bad-value"]')!.textContent).toContain(
+      "no decoder for t.Q.lcm.v1",
+    );
+  });
 
   it("waits for a robot, shows its channels, and clears them when it leaves", () => {
     expect(container.textContent).toContain("Waiting for a robot");
@@ -188,7 +225,8 @@ describe("App session states", () => {
     const value = () => container.querySelector('[data-testid="ch-color_image-value"]')!;
     expect(value().textContent).toContain("not subscribed (no panel binds it)");
 
-    // The manifest gains a video panel: the session subscribes, the row waits.
+    // The manifest gains a video panel: usable now, but this tab shows no
+    // panel, so the channel is released and the row says why.
     act(() => {
       status.update({
         manifest: mf([ODOM, IMAGE], [
@@ -196,7 +234,24 @@ describe("App session states", () => {
         ]),
       });
     });
-    expect(value().textContent).toContain("waiting for data...");
+    expect(value().textContent).toContain("not subscribed (its panel is off screen)");
+  });
+
+  it("reports the panels on screen: the grid, none on the channels tab, the open page", () => {
+    const aux: PanelSpec = { id: "aux", kind: "readout", title: "", channels: [], params: {} };
+    const withPage: Manifest = { ...mf([ODOM, IMAGE], [CAM, aux]), pages: ["aux"] };
+    act(() => status.update({ watchedRobot: ROBOT, robots: [ROBOT], manifest: withPage }));
+    expect(shown.at(-1)).toEqual(["cam"]);
+    view("channels");
+    expect(shown.at(-1)).toEqual([]);
+    act(() => container.querySelector<HTMLElement>('[data-testid="tab-page-aux"]')!.click());
+    expect(shown.at(-1)).toEqual(["aux"]);
+    act(() => container.querySelector<HTMLElement>('[data-testid="tab-overview"]')!.click());
+    expect(shown.at(-1)).toEqual(["cam"]);
+    // A robot restart (same manifest, new epoch) reports the same set: no churn.
+    const before = shown.length;
+    act(() => status.update({ manifest: { ...withPage }, epoch: 1 }));
+    expect(shown.slice(before)).toEqual([["cam"]]);
   });
 
   it("keeps a chat page's transcript since join across tab switches", () => {
@@ -489,7 +544,7 @@ describe("App session states", () => {
 
     it("offers 'log out' only with a stored token; it forgets the token and reloads", () => {
       localStorage.setItem("dimos.cockpit.token", "tok-en");
-      act(() => root.render(<App session={session} />));
+      act(() => root.render(<App session={session} onShownPanels={(ids) => shown.push(ids)} />));
       act(() => logOut()!.click());
       expect(localStorage.getItem("dimos.cockpit.token")).toBeNull();
       expect(reload).toHaveBeenCalledTimes(1);

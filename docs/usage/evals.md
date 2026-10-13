@@ -36,52 +36,114 @@ Every runner invocation writes one `~/.local/state/dimos/evals/run-*/` directory
 To generate deterministic image questions from recordings, see
 [Visual Question Answering](/docs/usage/vqa.md).
 
-## Baseline Bash versus dimcode + dimOS
+## Baseline without dimOS versus dimcode + dimOS
 
-For the complete-stack comparison, use `PiAdapter` with a sandbox against `DimcodeAdapter`
-with the **same model**. The primary pair is Astra with Bash versus Astra in
-dimcode with dimOS. This measures the combined product/robotics-stack effect;
-it does not isolate the harness contribution.
+For the product comparison, run `PiAdapter` with `no_dimos=true` against `DimcodeAdapter`
+with the **same model**. The baseline keeps Pi's normal tools, the internet, pip, git and any
+public SDK; the only thing withheld is dimOS.
 
 ```bash skip
 dimos evals run dimos.evals.suites.examples --agent dimos.evals.agents.pi \
-  --allow bash,grep --set sandbox=true \
-  --set model=gpt-6-astra --set thinking=medium \
-  --set max_steps=12 --set max_output_tokens=4096
+  --set no_dimos=true --set model=gpt-6-astra --set thinking=medium \
+  --set max_steps=250 --set max_output_tokens=4096
 
 dimos evals run dimos.evals.suites.examples --agent dimos.evals.agents.dimcode \
   --set model=gpt-6-astra --set thinking=medium \
-  --set max_steps=12 --set max_output_tokens=4096
+  --set max_steps=250 --set max_output_tokens=4096
 ```
 
-`PiAdapter` uses Pi's stock loop, provider support, tracing, limits and cleanup.
-The allowlist exposes only Pi's Bash and grep tools. Linux bubblewrap isolates their filesystem,
-processes, environment and network. The shell can read selected observations in
-`/input` and write `/workspace`; host homes, dimOS source, virtual environments,
-credentials, MCP, and host services are unavailable. The ordinary system tools
-under `/usr` are read-only, with `/usr/local` hidden. Bash, grep, coreutils and
-system Python remain available. Record the host system package versions when
-freezing a pilot; this is not a portable pinned container image.
+The same switches compose with the tool allowlist and an explicit keyword list, so a
+restricted or differently guarded baseline is one flag away:
 
-The baseline receives selected point coordinates/colors as CSV, camera frames
-as lossless PNG and primitive observations as JSON, with timestamps and hashes.
-Selected PNGs are also attached to its initial model message because the allowed
-tools do not read images. No `agent_encode` summaries, labels, semantic tags or
-original database are exported. Dimcode receives the same selected observations
-through the dimOS store and retains its production tools. Representation and
-image-delivery differences are part of this stack comparison and must be reported.
+```bash skip
+# Bash and grep only, no dimOS
+dimos evals run dimos.evals.suites.examples --agent dimos.evals.agents.pi \
+  --allow bash,grep --set no_dimos=true --set model=gpt-6-astra
 
-The sandbox supports Bash and grep (including either alone or neither), and rejects
-other tools, skills, modules and MCP endpoints. Missing or
-unsupported isolation fails preflight; there is no unrestricted fallback. This
-adapter currently supports recordings only. Live tasks need a separately bounded
-vendor SDK/robot connection available to the baseline, without dimOS. A blocked
-robot interface is an unsupported case, not a baseline failure.
+# full Pi toolset, dimOS available, but any tool call naming a vendor SDK is denied
+dimos evals run dimos.evals.suites.examples --agent dimos.evals.agents.pi \
+  --exclude unitree_sdk2py,go2_webrtc --set model=gpt-6-astra
 
-The primary benchmark uses only these two Pi-based adapters. Using the dimOS
-CLI in the baseline violates the experiment's access policy.
-Dimcode's current adapter still needs grader and unrelated-data isolation before
-publication runs. Neither arm may receive task-specific solutions or hidden truth.
+# no tools at all: the model answers from the prompt
+dimos evals run dimos.evals.suites.examples --agent dimos.evals.agents.pi \
+  --allow "" --set model=gpt-6-astra
+```
+
+`no_dimos` is a field of the shared `AgentConfig`. Agents that are dimOS, dimcode and the MCP client, reject it; tool-less agents satisfy it as they are. For Pi it does four things. Pi runs with a `PATH` that has no dimOS executable or checkout
+venv, no `PYTHONPATH` and no `DIMOS_*` variables, so `import dimos` and `dimos` fail. A robot
+is exposed as live topics through `raw-robot-bridge` (below) and nothing else: no recording,
+no MCP tool listing, no `dimos mcp call` guidance. `excluded_keywords` defaults to
+`dimos, dimensionalos`, which denies any tool call that mentions them. And for `Dataset` cases,
+which ask about an existing recording with no robot running, the selected observations are
+exported as plain files, lossless PNGs, XYZ/RGB CSVs and JSON primitives with a manifest,
+because the memory store needs dimOS to read.
+
+`PiAdapter` uses Pi's stock loop, provider support, tracing, limits and cleanup; `no_dimos`
+changes only what it is handed. For a `Dataset` case the baseline receives selected point
+coordinates and colors as CSV, camera frames as lossless PNG and primitive observations as
+JSON, with timestamps and hashes; no `agent_encode` summaries, labels, semantic tags or the
+original database. For a robot case it receives the raw topics and `ROBOT.md`. Dimcode
+receives the same selected observations through the dimOS store, the robot through MCP, and
+keeps its production tools and skills. Representation and delivery differences between the
+arms are part of the comparison and belong in the report.
+
+The baseline runs on the host with the host's system packages; record their versions when
+freezing a pilot, this is not a pinned container image. Neither arm may receive task-specific
+solutions or hidden truth, and dimcode's production environment must not be able to reach
+graders or reference data.
+
+### Keyword guard
+
+`excluded_keywords` is shared `AgentConfig`; set it with `--exclude dimos,dimensionalos` or
+`--set excluded_keywords=[...]`. Before a tool runs, the shared Pi extension matches the call's
+arguments, lowercased, against each keyword as a whole token: `import dimos`, `/opt/dimos/x`,
+`dimos_lcm` and `github.com/dimensionalOS/dimos` hit; `dimosaurus` does not. The run's own
+workspace and config paths are stripped first, so a case directory under `~/.local/state/dimos`
+is not a hit. A denied call never executes; the model receives
+`Tool call denied: its arguments mention the excluded keyword "dimos"...` and continues. The
+guard reads arguments only: reasoning or answers that mention dimOS are untouched, and so is
+tool output. Denied calls are counted in the trajectory's `extra.blocked_calls`. Pi and dimcode
+both enforce it; single-call agents have no tools to guard.
+
+After the run, the runner re-checks executed calls (denied ones are recognised by their result
+text) and marks a trial `invalid: ...` in `error` if a keyword got through, for example a
+misconfigured extension. Invalid trials count as errors in the summary; report them separately.
+
+### Raw robot topics
+
+A suite composes the `raw-robot-bridge` module and sets `Sim(raw_bridge=True)`. The bridge republishes the
+robot connection's streams as plain Zenoh topics on a per-run loopback port (an attached dimos
+uses `tcp/127.0.0.1:7448`), a peer with multicast and gossip scouting off, so a subscriber sees these keys and none of dimOS's own bus:
+
+```
+robot/camera/jpeg        JPEG bytes per frame; attachment {"t": unix_seconds}
+robot/lidar/xyz_f32      float32 little-endian (N,3) metres in the lidar frame; attachment {"t": ...}
+robot/odom/json          {"t","x","y","z","qx","qy","qz","qw"}, base_link in the odom frame
+robot/camera_info/json   {"width","height","K"}, republished periodically
+robot/cmd_vel/json       subscribed: {"vx","vy","wz","t"}; clamped to 1.0 m/s and 1.5 rad/s, held for t seconds (max 2), then stop
+```
+
+These are the topics a Go2 produces. Every stream the bridge understands is optional, so the
+same module serves an arm when its blueprint provides them: joint state (with the measured TCP
+pose and a 0-1 gripper opening) on `robot/arm/state/json`, wrist depth and camera pose, and
+`robot/arm/twist/json` / `robot/arm/gripper/json` commands that drive the coordinator's
+`eef_twist` and gripper tasks. Robot-specific settings (camera and TCP frames, gripper joint and
+range) live in the robot's blueprint: `xarm-sim` composes a configured bridge and gets its TCP
+pose from the coordinator (`publish_frame_poses`); the Go2 suites list `raw-robot-bridge` with its
+defaults.
+
+Every suite with `raw_bridge=True` names its `ROBOT.md` template as `raw_guide`: `RAW_README`
+for the Go2, `RAW_ARM_README` for arms; a suite appends its robot facts (`XARM7_NOTES`).
+
+That is the surface a vendor SDK exposes: sensors out, body velocity with a deadman in. Nothing
+above the connection (map, costmap, planner, `move_to`, memory) and nothing beneath it (simulator
+state, scene assets). The baseline agent gets a `ROBOT.md` describing the endpoint and builds
+whatever it needs from there. The bridge is inert for the dimcode arm, which keeps both
+simulator launches identical. On real hardware there is no bridge: the baseline gets the
+robot's address and uses the vendor SDK directly, while dimOS records through its own connection.
+
+Budgets: building a recorder, a map and a navigator from live topics is long-horizon work; start
+at 250 requests and an hour per case for both arms.
 
 ### Shared Pi runtime
 
@@ -135,10 +197,8 @@ The production MCP-client adapter does not yet implement filtering and rejects
 explicit allowlists; single-call agents accept only an empty list or defaults.
 Adapters must enforce selection or reject it, never silently ignore it.
 
-Tool selection is independent of filesystem and network access. `--allow bash`
-still permits any program the shell can reach. For the no-dimOS baseline, also
-use `--set sandbox=true`; this currently supports only Pi with recorded inputs.
-The sandbox is a composed isolation helper, not another agent subclass.
+Tool selection is independent of what an allowed tool can reach: `--allow bash` still permits any
+program on the shell's PATH. Use `no_dimos` to keep dimOS off that path.
 
 ### Reading the metrics
 
@@ -248,7 +308,8 @@ options to the constructor: `QuestionAnswer(frames_per_stream=16)`.
 CLI values are parsed as JSON when possible; quote lists as shown below.
 
 **Tools.** The case's blueprint decides the tool set:
-`DimSimEnvironment(blueprint=...)` or `HabitatEnvironment(blueprint=...)`
+`DimSimEnvironment(blueprint=...)`, `HabitatEnvironment(blueprint=...)` or
+`MujocoEnvironment(blueprint=...)`
 supplies the robot stack plus `McpServer`, and its skill containers are the tools.
 There is no tool filter. The agent's `modules` list is appended to the
 launch command (`dimos run <blueprint> <modules>`), and `autoconnect` dedups
@@ -260,6 +321,15 @@ recording if their tools need it. `Dataset(mcp_url=...)` attaches an
 already-running dimos instead. To
 compare two tool sets on one task, run the suite twice with different
 `--set modules=...`; each `trajectory.json` records the tools exposed.
+
+**Files.** An environment produces artifacts, files by name such as `recording`.
+The grader gets all of them. The agent gets only the ones named in the
+environment's `agent_artifacts`: by default the `recording` for simulators and
+the `image` for `ImageFile`. A `Dataset` names none, since its `recording` is
+the whole dataset and the agent is given the `select`ed streams instead. A file
+that holds answers, like Habitat's episode metadata with its prop positions,
+stays with the grader. Pass `agent_artifacts=(...)` to the environment to
+change it.
 
 **Limits.** The case's `timeout_s` sets the time budget for the agent and
 subsequent motion settling. `McpClientAdapter` returns what it has when its
@@ -308,7 +378,7 @@ an **error**, not a score; the run continues.
 ## Live environments
 
 `Sim` is the abstract base for simulator environments. Use `DimSimEnvironment`
-for DimSim or `HabitatEnvironment` for Habitat.
+for DimSim, `HabitatEnvironment` for Habitat or `MujocoEnvironment` for MuJoCo.
 
 `DimSimEnvironment` launches `dimos --simulation dimsim --dimsim-scene <scene> --record run
 <blueprint> <modules>`, waits for MCP, runs the case's `setup`, and hands out the
@@ -376,9 +446,68 @@ sensor streams and navigation streams supplied by the composed blueprint.
 The metadata's `point_cloud_source` describes how Habitat scans are generated
 (depth unprojection), not whether scan publication is enabled.
 
+For MuJoCo, the blueprint brings its own `MujocoSimModule` and scene, so the
+environment only launches `dimos --simulation mujoco --record run <blueprint>
+<modules>` headless; `MUJOCOSIMMODULE__HEADLESS=false` in the shell opens the viewer on
+Linux. Manipulation graders need ground-truth object poses:
+`tracked_bodies` names free bodies in the MJCF, and the simulator publishes
+`world -> <body>` on `tf` next to its camera frames. `first_body_transform` and
+`last_body_transform` read them back from the recording:
+
+```python session=evals ansi=false no-result
+from dimos.evals.environments.lib.recorded_poses import first_body_transform, last_body_transform
+from dimos.evals.environments.mujoco_sim import MujocoEnvironment
+
+
+def lifted_apple(o):
+    with recording(o) as store:
+        start = first_body_transform(store, "apple").translation.z
+        end = last_body_transform(store, "apple").translation.z
+    return min(max((end - start) / 0.05, 0.0), 1.0)
+
+
+lift_apple = EvalCase(
+    id="lift_apple",
+    inputs="Pick up the apple and hold it in the air above the table.",
+    environment=MujocoEnvironment(
+        blueprint=["xarm-perception-sim", "mcp-server"],
+        disable=("rerun-bridge-module",),
+        tracked_bodies=("apple", "orange", "cup"),
+    ),
+    grade=lifted_apple,
+    timeout_s=600.0,
+)
+```
+
+A fixed-base arm has no odometry, so readiness waits for fresh `color_image`
+and `coordinator_joint_state` plus a pose for every tracked body, and settling
+waits until every joint is slower than `at_rest_rad_s`. Floating-base robots
+still settle on `odom`. The recording keeps color, camera info, joint state,
+`tf` and `odom`; depth frames are float32, which the JPEG recorder rejects. `module_env` passes extra
+`MODULE__FIELD` overrides to the launched dimos, which beat blueprint-pinned
+values, so a case can retune a module without a new blueprint. `scene` passes
+`--mujoco-scene`: a full MJCF, robot included, that `xarm-perception-sim` loads
+instead of its default `scene.xml`. `base_height` sets the planning model's
+existing `base_pose` to world `(0, 0, height)` with identity orientation. Without it,
+the robot's configured base pose is retained (0.12 m for the default xArm scene).
+`dimos.evals.suites.mujoco_xarm` is the xArm7 table scene with the perception
+modules disabled: pick up the cylinder, then put the red ball on top of it.
+
+`dimos.evals.suites.mujoco_xarm_pick` evaluates a cylinder lift in the default
+scene using plain robot commands and observations (see Raw robot topics). Run it
+with Pi and `--set no_dimos=true --set max_steps=120`.
+
+`dimos.evals.suites.robosuite` provides six manipulation cases using
+recorded body poses. See `data/robosuite/README.md` in the downloaded data
+package for tasks, scene setup and usage; use `--tags <scene>` to select a case.
+
 ## Running
 
 - **CLI**: `dimos evals run <dotted.suite> --agent <agent-module> [--set model=gpt-4o] [--tags nav] [--limit 5]`
+- **Docker**: add `--docker` to run that eval in a fresh, detached container
+  from the eval image, one per invocation, any number side by side on one
+  host; setup, GPU rendering and an EC2 runbook are in
+  [`evals-docker.md`](/docs/usage/evals-docker.md).
 - **Python**: `EvalRunner().run(SUITE, agent, tags=frozenset({"encoding"}))`
 - **pytest**: suites are importable lists. Use
   `@pytest.mark.parametrize("case", SUITE)` and assert on `passed`

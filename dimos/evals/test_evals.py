@@ -43,13 +43,14 @@ from dimos.evals.agents.lib.trajectory_builder import TrajectoryBuilder
 from dimos.evals.agents.mcp_client_adapter import McpClientAdapter
 from dimos.evals.agents.question_answer import QuestionAnswer
 from dimos.evals.cli import load_agent
+from dimos.evals.constants import RAW_README
 from dimos.evals.environments.base import Environment
 from dimos.evals.environments.dataset import Dataset
 from dimos.evals.environments.dimsim import DimSimEnvironment
 from dimos.evals.environments.image_file import ImageFile
 from dimos.evals.environments.lib.launch import default_mcp_url
 from dimos.evals.module import list_agents
-from dimos.evals.runner import EvalRunner, summarize
+from dimos.evals.runner import EvalRunner, forbidden_call, summarize
 from dimos.evals.scorers import (
     choice,
     exact,
@@ -122,7 +123,7 @@ class FakeEnvironment(Environment):
     """A frozen recording that records lifecycle calls."""
 
     def __init__(self, path: Path, calls: list[str]) -> None:
-        super().__init__()
+        super().__init__(agent_artifacts=("recording",))
         self.path = path
         self.calls = calls
         self.settled_budget: float | None = None
@@ -456,6 +457,21 @@ def test_runner_uses_unique_directory_when_timestamps_match(
     assert second.run_dir.name.startswith("run-20260831-120000-")
 
 
+@pytest.mark.parametrize(("open_output", "mode"), [(None, 0o700), ("1", 0o777)])
+def test_run_dir_is_private_unless_opened(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, open_output: str | None, mode: int
+) -> None:
+    if open_output is None:
+        monkeypatch.delenv("DIMOS_EVALS_OPEN_OUTPUT", raising=False)
+    else:
+        monkeypatch.setenv("DIMOS_EVALS_OPEN_OUTPUT", open_output)
+    runner = EvalRunner(out_dir=tmp_path)
+
+    runner.run([], FakeAgent())
+
+    assert runner.run_dir.stat().st_mode & 0o777 == mode
+
+
 def test_runner_end_to_end_offline(dataset: str, tmp_path: Path) -> None:
     calls: list[str] = []
     env = FakeEnvironment(Path(dataset), calls)
@@ -658,6 +674,31 @@ def test_runner_missing_artifact_is_an_error(tmp_path: Path) -> None:
     case = EvalCase(id="c", inputs="x", environment=env, grade=grade)
     result = EvalRunner(out_dir=tmp_path).run([case], FakeAgent(answer="ok"))[0]
     assert result.error == "missing artifacts: ['recording']" and not graded
+
+
+def test_runner_gives_the_agent_only_agent_artifacts(tmp_path: Path) -> None:
+    seen: dict[str, set[str]] = {}
+
+    class WithAnswers(FakeEnvironment):
+        def start(self, modules: Sequence[str]) -> RunningEnvironment:
+            return RunningEnvironment(
+                mcp_url="", streams=(), artifacts={"recording": self.path, "answers": self.path}
+            )
+
+    class Looking(FakeAgent):
+        def run(
+            self, inputs: str, env: RunningEnvironment, run_dir: Path, *, timeout_s: float
+        ) -> Trajectory:
+            seen["agent"] = set(env.artifacts)
+            return super().run(inputs, env, run_dir, timeout_s=timeout_s)
+
+    def grade(outcome: Outcome) -> float:
+        seen["grader"] = set(outcome.artifacts)
+        return 1.0
+
+    case = EvalCase(id="c", inputs="x", environment=WithAnswers(tmp_path, []), grade=grade)
+    EvalRunner(out_dir=tmp_path).run([case], Looking(answer="ok"))
+    assert seen == {"agent": {"recording"}, "grader": {"recording", "answers"}}
 
 
 def test_recording_helper_opens_the_artifact(dataset: str) -> None:
@@ -864,6 +905,68 @@ def test_summary_and_trajectory_preserve_unknown_cost(
     assert summary.mean_score == summary.pass_rate == 0.0
 
 
+def _trajectory_with(command: str, result: str) -> Trajectory:
+    builder = TrajectoryBuilder("q", name="t", model="m")
+    builder.step(
+        message="",
+        reasoning="",
+        tool_calls=(
+            ToolCall(tool_call_id="c1", function_name="bash", arguments={"command": command}),
+        ),
+        metrics=Metrics(prompt_tokens=1, completion_tokens=1),
+        model_name="m",
+        latency_s=0.0,
+        reasoning_tokens=0,
+        request=Path("r"),
+        response=Path("s"),
+    )
+    builder.observe("c1", result)
+    return builder.build("answer")
+
+
+@pytest.mark.parametrize(
+    "command,result,ignored,expected",
+    [
+        (
+            "pip install dimos",
+            "Successfully installed dimos",
+            (),
+            "invalid: step 2 ran bash mentioning 'dimos'",
+        ),
+        (
+            "pip install dimos",
+            "Tool call denied: its arguments mention the excluded keyword",
+            (),
+            "",
+        ),
+        ("echo dimosaurus", "dimosaurus", (), ""),
+        ("cat /tmp/dimos/run/notes", "x", ("/tmp/dimos/run",), ""),
+        (
+            "git clone https://github.com/DimensionalOS/x",
+            "done",
+            (),
+            "invalid: step 2 ran bash mentioning 'dimensionalos'",
+        ),
+    ],
+)
+def test_forbidden_call_flags_only_executed_whole_word_hits(
+    command: str, result: str, ignored: tuple[str, ...], expected: str
+) -> None:
+    trajectory = _trajectory_with(command, result)
+    assert forbidden_call(trajectory, ("dimos", "dimensionalos"), *ignored) == expected
+    assert forbidden_call(trajectory, ()) == ""
+
+
+@pytest.mark.parametrize(
+    "reply,expected",
+    [("**Yes.**\n\nAll frames show a person", "yes"), ("_no_", "no"), ("Yes", "yes")],
+)
+def test_yes_no_tolerates_markdown_emphasis(reply: str, expected: str) -> None:
+    from dimos.evals.scorers import yes_no
+
+    assert yes_no(reply) == expected
+
+
 def test_failed_agent_run_keeps_its_duration(dataset: str, tmp_path: Path) -> None:
     class RaisingAgent(FakeAgent):
         def run(
@@ -881,3 +984,78 @@ def test_failed_agent_run_keeps_its_duration(dataset: str, tmp_path: Path) -> No
     result = EvalRunner(out_dir=tmp_path).run([case], RaisingAgent())[0]
     assert "adapter died" in result.error
     assert result.agent_duration_s >= 0.05
+
+
+def test_attach_with_raw_bridge_needs_a_listening_bridge() -> None:
+    from dimos.evals.environments.dimsim import DimSimEnvironment
+
+    env = DimSimEnvironment(
+        blueprint=["unitree-go2"], attach=True, raw_bridge=True, raw_guide=RAW_README
+    )
+    env.config.launch_timeout_s = 1.0
+    with pytest.raises(RuntimeError, match="raw-robot-bridge"):
+        env.start(())
+
+
+def test_parsers_take_the_answer_after_an_explanation() -> None:
+    # Verbatim replies from the 2026-09-15 apartment matrix (Fable 5.1, Opus 4.7).
+    rooms = (
+        "I've now explored the whole footprint (~10 m x 12 m). The rooms observed are:\n\n"
+        "1. **Living/dining room** (sofa, TV) - start room\n2. **Bedroom** (bed) - west\n"
+        "3. **Bathroom** (bathtub, toilet) - north\n4. **Kitchen** (oven, fridge) - south\n\n4"
+    )
+    assert first_number(rooms) == 4  # not the list index 1
+    doorway = (
+        "All four passable doorways (NE<->SW at x~0, NW<->SW at y~1) measure 1.00 m wide in the "
+        "lidar map, so the largest robot radius that fits is half of that.\n\n0.5"
+    )
+    assert first_number(doorway) == 0.5
+    assert (
+        first_number(
+            "...the top edge projects to ~2.05-2.08 m across three viewpoints.\n\n**2.05**"
+        )
+        == 2.05
+    )
+    assert (
+        yes_no(
+            "The bathroom (frame at yaw 62) shows a bathtub with a faucet, alongside a toilet.\n\nyes"
+        )
+        == "yes"
+    )
+    assert (
+        yes_no("...the apartment contains additional rooms consistent with a bathroom.\n\nyes")
+        == "yes"
+    )
+    fridge = "Close-up confirms the refrigerator: both doors are flush and shut (k5.jpg).\n\n**A**"
+    assert choice("ABCD", case_sensitive=True)(fridge) == "A"
+
+    # Shapes the matrix did not produce but the rule must cover.
+    assert first_number(rooms + " rooms") == 4  # value with a trailing word
+    assert (
+        first_number("Length 2.05 m and width 1.51 m.\n\n~ 3.1 sq m") == 3.1
+    )  # unit on the last line
+    assert first_number("Counted twice.\n\nAnswer: 4") == 4
+    assert first_number(rooms + "**.") == 4  # emphasis and punctuation together
+    assert first_number("**3.4**") == 3.4
+    assert first_number("There are 20,834 points in the frame.") == 20834  # thousands separator
+    assert first_number("About 12.5 meters, give or take.") == 12.5  # single line: first number
+    assert (
+        first_number("I see 4 chairs and 1 table.") == 4
+    )  # two numbers on the last line: first wins
+    assert first_number("-3") == -3.0
+    assert yes_no("Visible.\n\n**yes**.") == "yes"
+    assert yes_no("**No.**") == "no"
+    assert yes_no("Checked every room.\n\nAnswer: no") == "no"
+    assert yes_no("Yes, there is one.") == "yes"
+    assert yes_no("No bathtub, but yes a shower.") == "no"  # ambiguous last line: opening word wins
+    lettered = choice("ABCD", case_sensitive=True)
+    assert lettered("It is a kitchen with a fridge, so B.") == "B"  # the article "a" does not count
+    assert lettered("(C)") == "C"
+    assert lettered("I would say B, not A.") == "A"  # last option named wins, as documented
+    assert choice(["swimming pool", "sofa"])("no swimming pool, just a sofa") == "sofa"
+    with pytest.raises(ValueError, match="no option"):
+        lettered("no idea")
+    with pytest.raises(ValueError, match="no number"):
+        first_number("none")
+    with pytest.raises(ValueError, match="not a yes/no"):
+        yes_no("maybe\n\nunclear")

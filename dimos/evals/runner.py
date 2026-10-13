@@ -25,7 +25,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 import json
+import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import time
@@ -33,6 +35,7 @@ from typing import Any
 
 from dimos.constants import DIMOS_PROJECT_ROOT, STATE_DIR
 from dimos.evals.agents.base import Agent
+from dimos.evals.constants import DENIED
 from dimos.evals.types import (
     EvalCase,
     EvalResult,
@@ -164,13 +167,28 @@ class EvalRunner(Configurable):
                 )
                 started = time.monotonic()
                 try:
-                    trajectory = agent.run(case.inputs, env, case_dir, timeout_s=case.timeout_s)
+                    agent_artifacts = {
+                        name: env.artifacts[name]
+                        for name in case.environment.config.agent_artifacts
+                    }
+                    trajectory = agent.run(
+                        case.inputs,
+                        replace(env, artifacts=agent_artifacts),
+                        case_dir,
+                        timeout_s=case.timeout_s,
+                    )
                 finally:
                     agent_duration_s = time.monotonic() - started
                 _write_trajectory(case_dir, trajectory, tools)
                 case.environment.settle(max(0.0, case.timeout_s - agent_duration_s))
             finally:
                 case.environment.stop()
+            if violation := forbidden_call(
+                trajectory, agent.config.excluded_keywords, str(case_dir)
+            ):
+                return self._result(
+                    case, t0, trajectory, agent_duration_s=agent_duration_s, error=violation
+                )
             if trajectory.extra.ended_by == "error":
                 return self._result(
                     case,
@@ -242,7 +260,11 @@ class EvalRunner(Configurable):
     def _new_run_dir(self) -> Path:
         self.config.out_dir.mkdir(parents=True, exist_ok=True)
         prefix = time.strftime("run-%Y%m%d-%H%M%S-")
-        return Path(tempfile.mkdtemp(prefix=prefix, dir=self.config.out_dir))
+        path = Path(tempfile.mkdtemp(prefix=prefix, dir=self.config.out_dir))
+        # The eval container runs as root; open the run dir so the host user can read it.
+        if os.environ.get("DIMOS_EVALS_OPEN_OUTPUT") == "1":
+            path.chmod(0o777)
+        return path
 
     def _write_artifacts(self, results: list[EvalResult]) -> None:
         lines = [json.dumps(asdict(r)) for r in results]
@@ -250,6 +272,25 @@ class EvalRunner(Configurable):
         summary: dict[str, Any] = asdict(summarize(results))
         summary["manifest"] = "manifest.json"
         (self.run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+
+
+def forbidden_call(trajectory: Trajectory, keywords: Sequence[str], *ignored: str) -> str:
+    """``"invalid: ..."`` when a tool call mentioning an excluded keyword executed anyway."""
+    if not keywords:
+        return ""
+    pattern = re.compile("|".join(rf"(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])" for k in keywords))
+    for step in trajectory.steps:
+        results = step.observation.results if step.observation else ()
+        denied = {r.source_call_id for r in results if r.content.startswith(DENIED)}
+        for call in step.tool_calls or ():
+            if call.tool_call_id in denied:
+                continue
+            text = json.dumps(call.arguments).lower()
+            for path in ignored:
+                text = text.replace(path.lower(), "")
+            if match := pattern.search(text):
+                return f"invalid: step {step.step_id} ran {call.function_name} mentioning {match.group()!r}"
+    return ""
 
 
 def _tools_exposed(mcp_url: str) -> list[str]:
